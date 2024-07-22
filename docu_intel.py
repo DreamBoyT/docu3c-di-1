@@ -4,7 +4,6 @@ import tempfile
 import time
 import concurrent.futures
 from langchain import LLMChain, PromptTemplate
-from langchain.text_splitter import CharacterTextSplitter
 from langchain.document_loaders import PyPDFLoader
 from langchain.vectorstores import FAISS
 from langchain.chains.question_answering import load_qa_chain
@@ -40,14 +39,6 @@ llm = AzureChatOpenAI(
     temperature=0.5,  # Adjusted temperature for improved summaries
 )
 
-# Text Splitter
-text_splitter = CharacterTextSplitter(
-    separator="\n",
-    chunk_size=1500,
-    chunk_overlap=200,
-    length_function=len,
-)
-
 # Streamlit user interface
 st.title("Document Intelligent Application")
 pdf_file = st.sidebar.file_uploader("Choose a PDF file", type="pdf")
@@ -58,7 +49,7 @@ def extract_text_from_pdf(file):
 
 def create_prompt(page_numbers, combined_text):
     combined_text = combined_text.replace("{", "{{").replace("}", "}}")
-    return f"""Generate a concise and informative summary of the main content from these pages, using letters (a), (b), (c), etc. to denote each key point. Allow the summary to unfold naturally, without a predetermined number of points. Focus on capturing the most essential and relevant information, ensuring that each point adds significant value to the summary. Prioritize quality over quantity, and avoid including unnecessary points. Optimize the summary for clarity, coherence, and speed of generation.
+    return f"""Provide 3-5 key highlights that summarize the main content of these pages using letters (a), (b), (c), (d).
 
     {combined_text}
     """
@@ -71,7 +62,7 @@ def summarize_pages(llm, page_numbers, combined_text):
     start_page, end_page = page_numbers[0], page_numbers[-1]
     return f"*Pages {start_page}-{end_page}:*\n\n{response.strip()}\n"
 
-def group_texts(texts, group_size=3):
+def group_texts(texts, group_size):
     grouped_texts = []
     for i in range(0, len(texts), group_size):
         group = texts[i:i + group_size]
@@ -129,24 +120,18 @@ if pdf_file is not None:
     summary_option = st.sidebar.radio(
         "Choose Summary Option",
         options=[
-            "Generate 1 Page Summary",
+            "Generate 2 Page Summary",
             "Generate 3 Page Summary (default)",
             "Generate 5 Page Summary"
         ],
         index=1
     )
 
-    if summary_option == "Generate 1 Page Summary":
-        combined_content = ''.join([p.page_content for p in pages])
-        texts = text_splitter.split_text(combined_content)
-        overall_summary = extract_summaries_from_pdf(llm, pdf_path, group_size=1)
+    if summary_option == "Generate 2 Page Summary":
+        overall_summary = extract_summaries_from_pdf(llm, pdf_path, group_size=2)
     elif summary_option == "Generate 3 Page Summary (default)":
-        combined_content = ''.join([p.page_content for p in pages])
-        texts = text_splitter.split_text(combined_content)
         overall_summary = extract_summaries_from_pdf(llm, pdf_path, group_size=3)
     elif summary_option == "Generate 5 Page Summary":
-        combined_content = ''.join([p.page_content for p in pages])
-        texts = text_splitter.split_text(combined_content)
         overall_summary = extract_summaries_from_pdf(llm, pdf_path, group_size=5)
 
     if overall_summary:
@@ -214,8 +199,7 @@ if pdf_file is not None:
     if st.button("Submit"):
         if question:
             combined_content = ''.join([p.page_content for p in pages])
-            texts = text_splitter.split_text(combined_content)
-            document_search = FAISS.from_texts(texts, embed_model)
+            document_search = FAISS.from_texts([combined_content], embed_model)
             docs = document_search.similarity_search(question)
             chain = load_qa_chain(llm, chain_type="stuff")
             summaries = chain.run(
