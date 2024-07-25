@@ -11,6 +11,14 @@ from PyPDF2 import PdfReader
 from io import BytesIO
 from docx import Document as DocxDocument
 import base64
+import re
+import nltk
+from nltk.corpus import stopwords
+from gensim import corpora
+from gensim.models.ldamodel import LdaModel
+from langchain.text_splitter import CharacterTextSplitter
+
+nltk.download('stopwords')
 
 # Azure OpenAI API details
 azure_api_key = 'c09f91126e51468d88f57cb83a63ee36'
@@ -41,26 +49,59 @@ llm = AzureChatOpenAI(
 
 # Streamlit user interface
 st.title("Document Intelligent Application")
-pdf_file = st.sidebar.file_uploader("Choose a PDF file", type="pdf")
+pdf_file = st.file_uploader("Choose a PDF file", type="pdf")
+
+def preprocess_text(text):
+    text = text.lower()
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'\[.*?\]', '', text)
+    text = re.sub(r'\w*\d\w*', '', text)
+    text = re.sub(r'http\S+', '', text)
+    text = re.sub(r'[^a-zA-Z\s]', '', text)
+    return text
 
 def extract_text_from_pdf(file):
     reader = PdfReader(file)
-    return [(i + 1, page.extract_text()) for i, page in enumerate(reader.pages)]
+    return [(i + 1, preprocess_text(page.extract_text())) for i, page in enumerate(reader.pages)]
 
-def create_prompt(page_numbers, combined_text):
+def extract_topics(texts, num_topics=4, num_words=5):
+    stop_words = set(stopwords.words('english'))
+    texts = [[word for word in text.split() if word not in stop_words] for _, text in texts]
+    dictionary = corpora.Dictionary(texts)
+    corpus = [dictionary.doc2bow(text) for text in texts]
+    lda = LdaModel(corpus, num_topics=num_topics, id2word=dictionary, passes=10)
+    topics = lda.print_topics(num_words=num_words)
+    return topics
+
+def create_prompt(page_numbers, combined_text, topics):
     combined_text = combined_text.replace("{", "{{").replace("}", "}}")
-    return f"""Provide 3-5 key highlights that summarize the main content of these pages using letters (a), (b), (c), (d).
+    topics_text = "\n".join([f"Topic {i+1}: {topic}" for i, topic in enumerate(topics)])
+    
+    return f"""
+    For each of the key topics extracted from the text, please provide the following information in a clear and structured format:
 
+    1. Topic: Provide the topic name in one line. Ensure that the topic is insightful and relevant to the content of the pages.
+    
+    2. Subtopics: List 3-5 subtopics each that describe the main content of these pages in a line without any extra points added to the subtopic.
+
+    3. Summary: Write a detailed paragraph summary of the topic.
+
+    Here are the topics extracted and the text for reference:
+
+    Topics extracted:
+    {topics_text}
+
+    Text:
     {combined_text}
     """
 
-def summarize_pages(llm, page_numbers, combined_text):
-    prompt = create_prompt(page_numbers, combined_text)
+def summarize_pages(llm, page_numbers, combined_text, topics):
+    prompt = create_prompt(page_numbers, combined_text, topics)
     prompt_template = PromptTemplate.from_template(prompt)
     chain = LLMChain(llm=llm, prompt=prompt_template)
     response = chain.run({"combined_text": combined_text})
     start_page, end_page = page_numbers[0], page_numbers[-1]
-    return f"*Pages {start_page}-{end_page}:*\n\n{response.strip()}\n"
+    return f"Pages {start_page}-{end_page}:\n\n{response.strip()}\n"
 
 def group_texts(texts, group_size):
     grouped_texts = []
@@ -75,40 +116,63 @@ def extract_summaries_from_pdf(llm, file, group_size):
     texts = extract_text_from_pdf(file)
     grouped_texts = group_texts(texts, group_size)
     summaries = [None] * len(grouped_texts)
+
+    def process_group(idx, page_numbers, combined_text):
+        try:
+            topics = extract_topics([(num, combined_text) for num in page_numbers])
+            return summarize_pages(llm, page_numbers, combined_text, topics)
+        except Exception as e:
+            start_page, end_page = page_numbers[0], page_numbers[-1]
+            return f"Pages {start_page}-{end_page}:\n\nError summarizing pages {start_page}-{end_page}: {e}\n"
+
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = {executor.submit(summarize_pages, llm, page_numbers, combined_text): idx for idx, (page_numbers, combined_text) in enumerate(grouped_texts)}
+        futures = {executor.submit(process_group, idx, page_numbers, combined_text): idx for idx, (page_numbers, combined_text) in enumerate(grouped_texts)}
         for future in concurrent.futures.as_completed(futures):
             idx = futures[future]
-            try:
-                summaries[idx] = future.result()
-            except Exception as e:
-                start_page, end_page = grouped_texts[idx][0][0], grouped_texts[idx][0][-1]
-                summaries[idx] = f"*Pages {start_page}-{end_page}:*\n\nError summarizing pages {start_page}-{end_page}: {e}\n"
+            summaries[idx] = future.result()
+
     return "\n".join(summaries)
 
-def generate_word_file(summaries):
+def generate_word_file(topics_data):
     doc = DocxDocument()
-    doc.add_heading('Document Summary', 0)
-    for summary in summaries.split("\n\n"):
-        doc.add_paragraph(summary)
+    doc.add_heading('Document Topics and Subtopics', 0)
+    
+    for topic_data in topics_data:
+        doc.add_heading(topic_data['topic'], level=1)
+        doc.add_heading('Subtopics', level=2)
+        for i, subtopic in enumerate(topic_data['subtopics']):
+            # Remove any leading numbering from the subtopic text
+            subtopic = re.sub(r'^\d+\.\s*', '', subtopic)
+            doc.add_paragraph(f"{i+1}. {subtopic}", style='List Number')
+    
     buffer = BytesIO()
     doc.save(buffer)
     buffer.seek(0)
     return buffer
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+def extract_topic_data(summary_text):
+    topics_data = []
+    topic_pattern = re.compile(r'Topic \d+: (.+)')
+    subtopics_pattern = re.compile(r'Subtopics:\n(.*?)\n\n', re.DOTALL)
+    summary_pattern = re.compile(r'Summary:\n(.*?)\n\n', re.DOTALL)
 
-def display_chat_history():
-    st.subheader("Chat History")
-    chat_container = st.container()
-    with chat_container:
-        for chat in st.session_state.chat_history:
-            st.write(chat)
-    st.write("End of Chat History")
+    topics = topic_pattern.findall(summary_text)
+    subtopics = subtopics_pattern.findall(summary_text)
+    summaries = summary_pattern.findall(summary_text)
 
-overall_summary = ""
-question_summaries = ""
+    # Ensure the lists have the same length
+    min_length = min(len(topics), len(subtopics), len(summaries))
+    topics = topics[:min_length]
+    subtopics = subtopics[:min_length]
+    summaries = summaries[:min_length]
+
+    for i in range(min_length):
+        topics_data.append({
+            'topic': topics[i],
+            'subtopics': subtopics[i].strip().split('\n'),
+            'summary': summaries[i].strip()
+        })
+    return topics_data
 
 if pdf_file is not None:
     with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
@@ -117,32 +181,31 @@ if pdf_file is not None:
         loader = PyPDFLoader(pdf_path)
         pages = loader.load_and_split()
 
-    summary_option = st.sidebar.radio(
-        "Choose Summary Option",
-        options=[
-            "Generate 2 Page Summary",
-            "Generate 3 Page Summary (default)",
-            "Generate 5 Page Summary"
-        ],
-        index=1
-    )
-
-    if summary_option == "Generate 2 Page Summary":
-        overall_summary = extract_summaries_from_pdf(llm, pdf_path, group_size=2)
-    elif summary_option == "Generate 3 Page Summary (default)":
-        overall_summary = extract_summaries_from_pdf(llm, pdf_path, group_size=3)
-    elif summary_option == "Generate 5 Page Summary":
-        overall_summary = extract_summaries_from_pdf(llm, pdf_path, group_size=5)
+    summary_option = "Generate 3 Page Summary (default)"
+    overall_summary = extract_summaries_from_pdf(llm, pdf_path, group_size=3)
 
     if overall_summary:
-        with st.sidebar:
+        topics_data = extract_topic_data(overall_summary)
+        
+        with st.container():
+            st.subheader(pdf_file.name)
+            for topic_data in topics_data:
+                with st.expander(topic_data['topic']):
+                    st.write("Subtopics:")
+                    for i, subtopic in enumerate(topic_data['subtopics']):
+                        # Remove any leading numbering from the subtopic text
+                        subtopic = re.sub(r'^\d+\.\s*', '', subtopic)
+                        st.write(f"{i+1}. {subtopic}")
+                    st.write("Summary:")
+                    st.write(topic_data['summary'])
+
+        with st.container():
             col1, col2 = st.columns([3, 1])
             with col1:
-                st.subheader(pdf_file.name)
-                st.write(overall_summary)
+                pass
             with col2:
-                word_file = generate_word_file(overall_summary)
-                file_name = pdf_file.name.rsplit('.', 1)[0] + "_summary.docx"
+                word_file = generate_word_file(topics_data)
+                file_name = pdf_file.name.rsplit('.', 1)[0] + "_topics.docx"
                 st.markdown(
                     f"""
                     <style>
@@ -187,32 +250,10 @@ if pdf_file is not None:
                     </style>
                     <div class="download-button">
                         <a href="data:application/octet-stream;base64,{base64.b64encode(word_file.getvalue()).decode()}" download="{file_name}">
-                            <button>Download Summary</button>
-                            <span class="tooltip" style="background-color: #1a1c23;">Download the summary in Word format</span>
+                            <button>Download Topics</button>
+                            <span class="tooltip" style="background-color: #1a1c23;">Download the topics and subtopics in Word format</span>
                         </a>
                     </div>
                     """,
                     unsafe_allow_html=True
                 )
-
-    question = st.text_input("Enter your question")
-    if st.button("Submit"):
-        if question:
-            combined_content = ''.join([p.page_content for p in pages])
-            document_search = FAISS.from_texts([combined_content], embed_model)
-            docs = document_search.similarity_search(question)
-            chain = load_qa_chain(llm, chain_type="stuff")
-            summaries = chain.run(
-                input_documents=docs,
-                question=question
-            )
-            st.subheader("Question Answering Result")
-            st.write(summaries)
-            st.session_state.chat_history.append({"question": question, "answer": summaries})
-        else:
-            st.warning("Please enter a valid question.")
-else:
-    time.sleep(35)
-    st.warning("No PDF file uploaded")
-
-display_chat_history()
